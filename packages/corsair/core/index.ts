@@ -279,9 +279,12 @@ function maybeStartTunnel(
 					console.log(`[corsair] tunnel active: ${url}${CORSAIR_TUNNEL_PATH}`);
 				})
 				.catch((err: unknown) => {
-					console.warn(
-						`[corsair] tunnel down: ${err instanceof Error ? err.message : String(err)}. Retrying — run \`corsair setup\` if it doesn't recover.`,
-					);
+					// Another running process of this app serves the tunnel: not an outage.
+					if (!(err instanceof Error && err.name === 'TunnelHeldError')) {
+						console.warn(
+							`[corsair] tunnel down: ${err instanceof Error ? err.message : String(err)}. Retrying — run \`corsair setup\` if it doesn't recover.`,
+						);
+					}
 					throw err;
 				}),
 	});

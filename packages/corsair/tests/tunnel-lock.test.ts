@@ -1,7 +1,14 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import type { AddressInfo } from 'node:net';
+import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { LockIo, LockRecord } from '../hub/tunnel/tunnel-lock';
 import {
+	defaultLockIo,
 	reapStaleTunnel,
 	releaseTunnelLock,
+	tunnelHeldByLiveOwner,
 	tunnelLockPath,
 	writeTunnelLock,
 } from '../hub/tunnel/tunnel-lock';
@@ -11,14 +18,18 @@ function fakeIo(overrides: Partial<LockIo> = {}): LockIo & {
 	files: Map<string, LockRecord>;
 	procs: Map<number, { frpc: boolean; start: string }>;
 	killed: Array<[number, NodeJS.Signals]>;
+	listening: Set<number>;
 } {
 	const files = new Map<string, LockRecord>();
 	const procs = new Map<number, { frpc: boolean; start: string }>();
 	const killed: Array<[number, NodeJS.Signals]> = [];
+	const listening = new Set<number>();
 	return {
 		files,
 		procs,
 		killed,
+		listening,
+		isListening: async (port) => listening.has(port),
 		read: (p) => files.get(p) ?? null,
 		write: (p, rec) => {
 			files.set(p, { ...rec });
@@ -221,5 +232,83 @@ describe('writeTunnelLock', () => {
 		const record = writeTunnelLock('/lock', 100, io);
 		expect(record).toEqual({ pid: 100, start: 'S1' });
 		expect(io.files.get('/lock')).toEqual({ pid: 100, start: 'S1' });
+	});
+
+	it('records this process and its guard port as the owner', () => {
+		const io = fakeIo();
+		io.procs.set(100, { frpc: true, start: 'S1' });
+		expect(writeTunnelLock('/lock', 100, io, 4000).owner).toEqual({
+			pid: process.pid,
+			guardPort: 4000,
+		});
+	});
+});
+
+describe('tunnelHeldByLiveOwner', () => {
+	const lock = { pid: 100, start: 'S1', owner: { pid: 50, guardPort: 4000 } };
+	const serving = () => {
+		const io = fakeIo();
+		io.files.set('/lock', lock);
+		io.procs.set(100, { frpc: true, start: 'S1' });
+		io.procs.set(50, { frpc: false, start: 'O1' });
+		io.listening.add(4000);
+		return io;
+	};
+
+	it('is true while the frpc, its owner and the guard are all up', async () => {
+		expect(await tunnelHeldByLiveOwner('/lock', serving())).toBe(true);
+	});
+
+	it('is false once the owner process is gone (a real orphan)', async () => {
+		const io = serving();
+		io.procs.delete(50);
+		expect(await tunnelHeldByLiveOwner('/lock', io)).toBe(false);
+	});
+
+	it('is false when the guard stopped listening (e.g. a terminated worker thread)', async () => {
+		const io = serving();
+		io.listening.delete(4000);
+		expect(await tunnelHeldByLiveOwner('/lock', io)).toBe(false);
+	});
+
+	it('is false when the frpc itself is gone', async () => {
+		const io = serving();
+		io.procs.delete(100);
+		expect(await tunnelHeldByLiveOwner('/lock', io)).toBe(false);
+	});
+
+	it('is false for a lock written before owner tracking', async () => {
+		const io = serving();
+		io.files.set('/lock', { pid: 100, start: 'S1' });
+		expect(await tunnelHeldByLiveOwner('/lock', io)).toBe(false);
+	});
+});
+
+describe('defaultLockIo', () => {
+	it('isListening reflects whether a loopback port accepts connections', async () => {
+		const server = createServer();
+		await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+		const { port } = server.address() as AddressInfo;
+		expect(await defaultLockIo.isListening(port)).toBe(true);
+		await new Promise((r) => server.close(r));
+		expect(await defaultLockIo.isListening(port)).toBe(false);
+	});
+
+	it('round-trips the owner and reads older two-line locks without one', () => {
+		const dir = mkdtempSync(join(tmpdir(), 'corsair-lock-'));
+		const path = join(dir, 'slug.pid');
+		const record = {
+			pid: 100,
+			start: 'S1',
+			owner: { pid: 50, guardPort: 4000 },
+		};
+		try {
+			defaultLockIo.write(path, record);
+			expect(defaultLockIo.read(path)).toEqual(record);
+			writeFileSync(path, '100\nS1');
+			expect(defaultLockIo.read(path)).toEqual({ pid: 100, start: 'S1' });
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

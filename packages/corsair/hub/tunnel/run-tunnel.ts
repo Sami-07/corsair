@@ -11,6 +11,7 @@ import type { LockRecord } from './tunnel-lock';
 import {
 	reapStaleTunnel,
 	releaseTunnelLock,
+	tunnelHeldByLiveOwner,
 	tunnelLockPath,
 	writeTunnelLock,
 } from './tunnel-lock';
@@ -125,6 +126,16 @@ export async function runTunnel(opts: {
 	// would overwrite its lock and leave it untracked. Throw so the supervisor
 	// (and the CLI retry) back off and try again once it's gone.
 	const lockPath = tunnelLockPath(slug);
+	// Another running process of this app already serves the tunnel (this one is
+	// e.g. a framework worker): leave it alone. The supervisor retries quietly
+	// and takes over once that owner is gone. "still held" keeps the CLI retry.
+	if (await tunnelHeldByLiveOwner(lockPath)) {
+		const err = new Error(
+			`frpc: slug ${slug} is still held by a running app process`,
+		);
+		err.name = 'TunnelHeldError';
+		throw err;
+	}
 	if (!(await reapStaleTunnel(lockPath))) {
 		throw new Error(
 			`frpc: slug ${slug} is still held by another process and could not be reaped`,
@@ -304,7 +315,13 @@ export async function runTunnel(opts: {
 		// throws (unwritable cache, disk full), fail() reaps the child, guard, and
 		// cfg instead of leaking an frpc that no later reap could find.
 		try {
-			if (child.pid) lockRecord = writeTunnelLock(lockPath, child.pid);
+			if (child.pid)
+				lockRecord = writeTunnelLock(
+					lockPath,
+					child.pid,
+					undefined,
+					guard.port,
+				);
 		} catch (err) {
 			fail(err instanceof Error ? err : new Error(String(err)));
 		}

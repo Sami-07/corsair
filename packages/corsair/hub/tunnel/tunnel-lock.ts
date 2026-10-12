@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { connect } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -17,6 +18,9 @@ export interface LockRecord {
 	pid: number;
 	/** OS process start time; '' when the platform couldn't report it. */
 	start: string;
+	/** The app process that spawned the frpc and the loopback port of the path
+	 *  guard frpc forwards to (absent in older locks). */
+	owner?: { pid: number; guardPort: number };
 }
 
 export interface ProcessInfo {
@@ -36,6 +40,7 @@ export interface LockIo {
 	inspect(pid: number): ProcessInfo;
 	kill(pid: number, signal: NodeJS.Signals): void;
 	sleep(ms: number): Promise<void>;
+	isListening(port: number): Promise<boolean>;
 }
 
 // Static PowerShell probe (Windows). A constant literal — not generated code:
@@ -61,18 +66,27 @@ function isOwnedBy(info: ProcessInfo, record: LockRecord): boolean {
 export const defaultLockIo: LockIo = {
 	read: (path) => {
 		try {
-			const [pidLine = '', start = ''] = readFileSync(path, 'utf8').split('\n');
+			const [pidLine = '', start = '', ownerLine = '', portLine = ''] =
+				readFileSync(path, 'utf8').split('\n');
 			const pid = Number.parseInt(pidLine.trim(), 10);
-			return Number.isInteger(pid) && pid > 0
-				? { pid, start: start.trim() }
-				: null;
+			const ownerPid = Number.parseInt(ownerLine.trim(), 10);
+			const guardPort = Number.parseInt(portLine.trim(), 10);
+			if (!Number.isInteger(pid) || pid <= 0) return null;
+			return ownerPid > 0 && guardPort > 0
+				? { pid, start: start.trim(), owner: { pid: ownerPid, guardPort } }
+				: { pid, start: start.trim() };
 		} catch {
 			return null;
 		}
 	},
 	write: (path, record) => {
 		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, `${record.pid}\n${record.start}`, { mode: 0o600 });
+		const owner = record.owner
+			? `\n${record.owner.pid}\n${record.owner.guardPort}`
+			: '';
+		writeFileSync(path, `${record.pid}\n${record.start}${owner}`, {
+			mode: 0o600,
+		});
 	},
 	remove: (path) => {
 		// Best-effort: a lock is advisory, so a failed removal must never break the
@@ -145,7 +159,39 @@ export const defaultLockIo: LockIo = {
 		}
 	},
 	sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+	isListening: (port) =>
+		new Promise((resolve) => {
+			const socket = connect({ host: '127.0.0.1', port });
+			const done = (listening: boolean): void => {
+				socket.destroy();
+				resolve(listening);
+			};
+			socket.setTimeout(1_000, () => done(false));
+			socket.once('connect', () => done(true));
+			socket.once('error', () => done(false));
+		}),
 };
+
+/**
+ * True when the recorded tunnel is still serving: its frpc is alive, the app
+ * process that spawned it is alive, and that app's path guard still listens.
+ * Such a tunnel is not an orphan and must not be reaped. Another process loading
+ * the same app (e.g. a `next dev` static-paths worker) hits this; reaping there
+ * dropped the dev server's tunnel. The guard check covers an owner that was a
+ * terminated worker thread (process alive, guard gone); the process check covers
+ * a dead owner whose guard port was reused.
+ */
+export async function tunnelHeldByLiveOwner(
+	path: string,
+	io: LockIo = defaultLockIo,
+): Promise<boolean> {
+	const record = io.read(path);
+	if (!record?.owner || !isOwnedBy(io.inspect(record.pid), record)) {
+		return false;
+	}
+	if (!io.inspect(record.owner.pid).alive) return false;
+	return io.isListening(record.owner.guardPort);
+}
 
 /**
  * Try to free this slug's slot by reaping the frpc recorded in the lockfile
@@ -212,14 +258,17 @@ function clearIfOurs(io: LockIo, path: string, record: LockRecord): void {
 	}
 }
 
-/** Record the frpc child we spawned (with its start-time identity) so the next
- *  start can reap it if we die abruptly. Returns the record for release to match. */
+/** Record the frpc child we spawned (with its start-time identity), plus this
+ *  process and its path guard port as the owner, so the next start can reap it
+ *  only if we die abruptly. Returns the record for release to match. */
 export function writeTunnelLock(
 	path: string,
 	pid: number,
 	io: LockIo = defaultLockIo,
+	guardPort?: number,
 ): LockRecord {
 	const record: LockRecord = { pid, start: io.inspect(pid).start ?? '' };
+	if (guardPort) record.owner = { pid: process.pid, guardPort };
 	io.write(path, record);
 	return record;
 }
